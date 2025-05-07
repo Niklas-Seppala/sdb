@@ -14,6 +14,16 @@
 #define INITIAL_PAGE_COUNT 1
 #define ERR_PAGE_ALLOC ((uint32_t)-1)
 
+// ----------------------------
+#define SDB_ERR_UNIQ_KEY  -1
+#define SDB_ERR_PAGE_FULL -2
+#define SDB_ERR_SYS       -3
+// ----------------------------
+#define SDB_SUCCESS        0
+#define SDB_FOUND          0
+#define SDB_NOT_FOUND     -1
+// ----------------------------
+
 /**
  * Macro for the sizeof operator on stack value
  */
@@ -95,15 +105,11 @@ int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
   assert(val != NULL && "val is null");
 
   SDBPageHeader *header = page;
+  assert(header->type == PAGE_LEAF && "Attempt to write on non-leaf page");
 
-  if (header->type != PAGE_LEAF) {
-    fprintf(stderr, "Attempt to write on non-leaf page\n");
-    return -1;
-  }
-
-  if (sdb_leaf_find(page, key, ksize, NULL, NULL) == 0) {
+  if (sdb_leaf_find(page, key, ksize, NULL, NULL) == SDB_FOUND) {
     fprintf(stderr, "record with key same key exists\n");
-    return -1;
+    return SDB_ERR_UNIQ_KEY;
   }
 
   uint16_t count = header->count;
@@ -113,7 +119,7 @@ int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
 
   if ((header->free_off + leaf_record_space_required(ksize, vsize)) >
       PAGE_SIZE) {
-    return -2;
+    return SDB_ERR_PAGE_FULL;
   }
 
   // TODO: refactor
@@ -152,10 +158,10 @@ int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
 
   if (msync(page, PAGE_SIZE, MS_SYNC) < 0) {
     perror("msync()");
-    return -1;
+    return SDB_ERR_SYS;
   }
 
-  return 0;
+  return SDB_SUCCESS;
 }
 
 // Record layout
@@ -169,10 +175,7 @@ int sdb_leaf_find(void *page, const char *key, uint16_t ksize, char *out_val,
   assert(ksize > 0 && "Key size can't be zero");
 
   SDBPageHeader *header = (SDBPageHeader *)page;
-  if (header->type != PAGE_LEAF) {
-    fprintf(stderr, "Attempt to read on non-leaf page\n");
-    return -1;
-  }
+  assert(header->type == PAGE_LEAF && "Attempt to search on non-leaf page");
 
   uint16_t *slots = leaf_record_slot_array(page);
 
@@ -209,11 +212,11 @@ int sdb_leaf_find(void *page, const char *key, uint16_t ksize, char *out_val,
         *out_vsize = rec_vsize;
         out_val[rec_vsize] = '\0'; // TODO: Just strings for now
       }
-      return 0;
+      return SDB_FOUND;
     }
   }
 
-  return -1;
+  return SDB_NOT_FOUND;
 }
 
 // Record layout
@@ -223,11 +226,7 @@ int sdb_leaf_scan(void *page) {
   assert(page != NULL && "page is null");
 
   SDBPageHeader *header = page;
-
-  if (header->type != PAGE_LEAF) {
-    fprintf(stderr, "Attempt to read on non-leaf page\n");
-    return -1;
-  }
+  assert(header->type == PAGE_LEAF && "Attempt to scan non-leaf page");
 
   uint16_t count = header->count;
   uint16_t *slots = leaf_record_slot_array(page);
@@ -267,7 +266,7 @@ int sdb_leaf_scan(void *page) {
   }
   printf("--------------------------------\n");
 
-  return 0;
+  return SDB_SUCCESS;
 }
 
 // Record layout
@@ -282,10 +281,7 @@ int sdb_leaf_update(void *page, const void *key, uint16_t ksize,
   assert(val != NULL && "val is null");
 
   SDBPageHeader *header = page;
-  if (header->type != PAGE_LEAF) {
-    fprintf(stderr, "Attempt to update non-leaf page\n");
-    return -1;
-  }
+  assert(header->type == PAGE_LEAF && "Attempt to write (update) non-leaf page");
 
   uint16_t *slots = leaf_record_slot_array(page);
   for (uint16_t i = 0; i < header->count; i++) {
@@ -306,11 +302,11 @@ int sdb_leaf_update(void *page, const void *key, uint16_t ksize,
     // TODO: support shifting
     if (rec_ksize != ksize) {
       fprintf(stderr, "key sizes don't match, won't update key\n");
-      return -1;
+      return SDB_NOT_FOUND;
     }
     if (rec_vsize != vsize) {
       fprintf(stderr, "value sizes don't match, won't update value\n");
-      return -1;
+      return SDB_NOT_FOUND;
     }
 
     uint32_t key_offset = sdb_ssizeof(rec_ksize) + sdb_ssizeof(rec_vsize);
@@ -328,12 +324,12 @@ int sdb_leaf_update(void *page, const void *key, uint16_t ksize,
       memcpy(val_ptr, val, vsize);
       if (msync(page, PAGE_SIZE, MS_SYNC) < 0) {
         perror("msync()");
-        return -1;
+        return SDB_ERR_SYS;
       }
-      return 0; // Success
+      return SDB_SUCCESS;
     }
   }
-  return -1; // Not found
+  return SDB_NOT_FOUND;
 }
 
 void init_leaf_page(void *page) {
