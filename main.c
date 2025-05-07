@@ -15,13 +15,13 @@
 #define ERR_PAGE_ALLOC ((uint32_t)-1)
 
 // ----------------------------
-#define SDB_ERR_UNIQ_KEY  -1
+#define SDB_ERR_UNIQ_KEY -1
 #define SDB_ERR_PAGE_FULL -2
-#define SDB_ERR_SYS       -3
+#define SDB_ERR_SYS -3
 // ----------------------------
-#define SDB_SUCCESS        0
-#define SDB_FOUND          0
-#define SDB_NOT_FOUND     -1
+#define SDB_SUCCESS 0
+#define SDB_FOUND 0
+#define SDB_NOT_FOUND -1
 // ----------------------------
 
 /**
@@ -50,7 +50,8 @@ typedef struct {
   uint8_t type;      // META 0x01 | LEAF 0x02
   uint8_t flags;     // RESREVED
   uint16_t count;    // Number of entries
-  uint32_t free_off; // Offset to first free byte on the page
+  uint32_t free_off; // Offset to first free byte on the page (after header +
+                     // slot array)
 } __attribute__((packed)) SDBPageHeader;
 
 typedef struct {
@@ -105,18 +106,19 @@ int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
   assert(val != NULL && "val is null");
 
   SDBPageHeader *header = page;
-  assert(header->type == PAGE_LEAF && "Attempt to write on non-leaf page");
+  assert(header->type == PAGE_LEAF &&
+         "Attempt to write (insert) on non-leaf page");
 
   if (sdb_leaf_find(page, key, ksize, NULL, NULL) == SDB_FOUND) {
     fprintf(stderr, "record with key same key exists\n");
     return SDB_ERR_UNIQ_KEY;
   }
 
-  uint16_t count = header->count;
+  const uint16_t count = header->count;
   size_t record_size = RECOR_HEADER_SIZE + ksize + vsize;
-  size_t slot_size = sizeof(uint16_t);
-  size_t slot_offset = sizeof(SDBPageHeader) + count * slot_size;
+  size_t slot_offset = sizeof(SDBPageHeader) + count * sizeof(uint16_t);
 
+  // Offset after all metadata + required space for this write.
   if ((header->free_off + leaf_record_space_required(ksize, vsize)) >
       PAGE_SIZE) {
     return SDB_ERR_PAGE_FULL;
@@ -125,10 +127,13 @@ int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
   // TODO: refactor
   uint16_t current_end =
       (count == 0)
+          // The page is empty, so at the very end.
           ? PAGE_SIZE
+          // Take it from the last item in 'slot' array
           : ((uint16_t *)((uint8_t *)page + sizeof(SDBPageHeader)))[count - 1];
-  uint16_t record_start = current_end - record_size;
-  uint8_t *record = (uint8_t *)page + record_start;
+  // Reserve space for the record.
+  uint16_t offset = current_end - record_size;
+  uint8_t *record = (uint8_t *)page + offset;
 
   // Copy key & value sizes to record header.
   memcpy(record, &ksize, sdb_ssizeof(ksize));
@@ -145,16 +150,15 @@ int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
 
   // Copy key to record.
   memcpy(record + key_offset, key, ksize);
-
   // Copy value to record.
   memcpy(record + val_offset, val, vsize);
-
+  // Store the record offset to slot array
   uint16_t *slots = leaf_record_slot_array(page);
-  slots[count] = record_start;
-
+  slots[count] = offset;
   // Update header
   header->count++;
-  header->free_off += slot_offset + slot_size;
+  // Plus sizeof(uint16_t) because we just added one, duh :P
+  header->free_off += slot_offset + sizeof(uint16_t);
 
   if (msync(page, PAGE_SIZE, MS_SYNC) < 0) {
     perror("msync()");
@@ -281,7 +285,8 @@ int sdb_leaf_update(void *page, const void *key, uint16_t ksize,
   assert(val != NULL && "val is null");
 
   SDBPageHeader *header = page;
-  assert(header->type == PAGE_LEAF && "Attempt to write (update) non-leaf page");
+  assert(header->type == PAGE_LEAF &&
+         "Attempt to write (update) non-leaf page");
 
   uint16_t *slots = leaf_record_slot_array(page);
   for (uint16_t i = 0; i < header->count; i++) {
@@ -461,7 +466,7 @@ int main(int argc, char const *argv[]) {
 
     const char *val1 = "Jenni";
     const char *new_val1 = "Janni";
-    
+
     sdb_leaf_insert(page, key, ksize, val1, strlen(val1));
 
     // this fails
