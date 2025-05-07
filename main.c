@@ -101,6 +101,11 @@ int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
     return -1;
   }
 
+  if (sdb_leaf_find(page, key, ksize, NULL, NULL) == 0) {
+    fprintf(stderr, "record with key same key exists\n");
+    return -1;
+  }
+
   uint16_t count = header->count;
   size_t record_size = RECOR_HEADER_SIZE + ksize + vsize;
   size_t slot_size = sizeof(uint16_t);
@@ -163,9 +168,6 @@ int sdb_leaf_find(void *page, const char *key, uint16_t ksize, char *out_val,
   assert(key != NULL && "Key can't be null");
   assert(ksize > 0 && "Key size can't be zero");
 
-  assert(out_val != NULL && "output buffer is null");
-  assert(out_vsize > 0 && "output buffer size can't be zero");
-
   SDBPageHeader *header = (SDBPageHeader *)page;
   if (header->type != PAGE_LEAF) {
     fprintf(stderr, "Attempt to read on non-leaf page\n");
@@ -201,9 +203,12 @@ int sdb_leaf_find(void *page, const char *key, uint16_t ksize, char *out_val,
 
     if (memcmp(key_ptr, key, ksize) == 0) {
       // Found a match
-      memcpy(out_val, val_ptr, rec_vsize);
-      *out_vsize = rec_vsize;
-      out_val[rec_vsize] = '\0'; // TODO: Just strings for now
+      if (out_val && out_vsize) {
+        // Only write output when requested.
+        memcpy(out_val, val_ptr, rec_vsize);
+        *out_vsize = rec_vsize;
+        out_val[rec_vsize] = '\0'; // TODO: Just strings for now
+      }
       return 0;
     }
   }
@@ -445,6 +450,7 @@ uint32_t sdb_alloc_page(SDB *db) {
 
 int main(int argc, char const *argv[]) {
   const char *key = "name";
+  const uint16_t ksize = strlen(key);
 
   SDB db = {0};
 
@@ -452,25 +458,21 @@ int main(int argc, char const *argv[]) {
     fprintf(stderr, "Failed to open db\n");
   }
 
-  uint32_t page = sdb_alloc_page(&db);
-  if (page != ERR_PAGE_ALLOC) {
-    void *page_ptr = sdb_get_page(&db, page);
-    init_leaf_page(page_ptr);
+  uint32_t new_page = sdb_alloc_page(&db);
+  if (new_page != ERR_PAGE_ALLOC) {
+    void *page = sdb_get_page(&db, new_page);
+    init_leaf_page(page);
 
     const char *val1 = "Jenni";
-    const char *val11 = "Janni";
+    const char *new_val1 = "Janni";
+    
+    sdb_leaf_insert(page, key, ksize, val1, strlen(val1));
 
-    const char *val2 = "Niklas";
-    const char *val3 = "Matti";
-    const char *val4 = "Mikko";
-    const char *val5 = "Iiro";
-    sdb_leaf_insert(page_ptr, key, strlen(key), val1, strlen(val1));
-    sdb_leaf_insert(page_ptr, key, strlen(key), val2, strlen(val2));
-    sdb_leaf_insert(page_ptr, key, strlen(key), val3, strlen(val3));
-    sdb_leaf_insert(page_ptr, key, strlen(key), val4, strlen(val4));
-    sdb_leaf_insert(page_ptr, key, strlen(key), val5, strlen(val5));
-
-    sdb_leaf_update(page_ptr, key, strlen(key), val11, strlen(val11));
+    // this fails
+    if (sdb_leaf_insert(page, key, ksize, new_val1, strlen(new_val1)) < 0) {
+      // this should work
+      sdb_leaf_update(page, key, ksize, new_val1, strlen(new_val1));
+    }
   }
 
   const int buff_size = 256;
