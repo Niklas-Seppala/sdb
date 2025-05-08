@@ -108,10 +108,18 @@ int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
   SDBPageHeader *header = page;
   assert(header->type == PAGE_LEAF &&
          "Attempt to write (insert) on non-leaf page");
-
-  if (sdb_leaf_find(page, key, ksize, NULL, NULL) == SDB_FOUND) {
-    fprintf(stderr, "record with key same key exists\n");
-    return SDB_ERR_UNIQ_KEY;
+  
+  // Enforce key uniqueness.
+  uint16_t *slots = leaf_record_slot_array(page);
+  for (uint16_t i = 0; i < header->count; i++) {
+    uint16_t off = slots[i];
+    uint8_t *rec = (uint8_t*)page + off;
+    uint16_t rec_ksize;
+    memcpy(&rec_ksize, rec, sdb_ssizeof(rec_ksize));
+    if (rec_ksize == ksize && memcmp(rec + 4, key, ksize) == 0) {
+      fprintf(stderr, "record with key='%s' same key exists\n", (char*)key);
+      return SDB_ERR_UNIQ_KEY;
+    }
   }
 
   const uint16_t count = header->count;
@@ -125,36 +133,54 @@ int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
   }
 
   // TODO: refactor
-  uint16_t current_end =
+  const uint16_t current_end =
       (count == 0)
           // The page is empty, so at the very end.
           ? PAGE_SIZE
           // Take it from the last item in 'slot' array
           : ((uint16_t *)((uint8_t *)page + sizeof(SDBPageHeader)))[count - 1];
   // Reserve space for the record.
-  uint16_t offset = current_end - record_size;
+  const uint16_t offset = current_end - record_size;
   uint8_t *record = (uint8_t *)page + offset;
 
-  // Copy key & value sizes to record header.
+  // Write key & value sizes to record header.
   memcpy(record, &ksize, sdb_ssizeof(ksize));
   memcpy(record + sdb_ssizeof(ksize), &vsize, sdb_ssizeof(vsize));
 
-  uint32_t key_offset = sdb_ssizeof(ksize) + sdb_ssizeof(vsize);
-  uint32_t val_offset = key_offset + ksize;
+  const uint32_t key_offset = sdb_ssizeof(ksize) + sdb_ssizeof(vsize);
+  const uint32_t val_offset = key_offset + ksize;
 
-  uint8_t *key_ptr = record + key_offset;
-  uint8_t *val_ptr = record + val_offset;
+  const uint8_t *key_ptr = record + key_offset;
+  const uint8_t *val_ptr = record + val_offset;
 
   assert((key_ptr + ksize + vsize) <= sdb_page_end(page) && "page overflow");
   assert((val_ptr + vsize) <= sdb_page_end(page) && "page overflow");
 
-  // Copy key to record.
+  // Write key to record.
   memcpy(record + key_offset, key, ksize);
-  // Copy value to record.
+  // Write value to record.
   memcpy(record + val_offset, val, vsize);
+
+
+  // slots[count] = offset;
   // Store the record offset to slot array
-  uint16_t *slots = leaf_record_slot_array(page);
-  slots[count] = offset;
+  uint16_t insert_pos = count;
+  for (uint16_t i = 0; i < count; i++) {
+    uint16_t off = slots[i];
+    uint8_t *rec = (uint8_t*)page + off;
+    uint16_t rec_ksize;
+    memcpy(&rec_ksize, rec, sdb_ssizeof(rec_ksize));
+    int cmp = memcmp(rec + 4, key, rec_ksize < ksize ? rec_ksize : ksize);
+    if (cmp > 0 || (cmp == 0 && ksize <  rec_ksize)) {
+      insert_pos = i;
+      break;
+    } 
+  }
+  for (int i = header->count; i > insert_pos; i--) {
+    slots[i] = slots[i-1];
+  }
+  slots[insert_pos] = offset;
+
   // Update header
   header->count++;
   // Plus sizeof(uint16_t) because we just added one, duh :P
@@ -450,8 +476,13 @@ uint32_t sdb_alloc_page(SDB *db) {
 }
 
 int main(int argc, char const *argv[]) {
-  const char *key = "name";
-  const uint16_t ksize = strlen(key);
+  const char *key1 = "a";
+  const char *key2 = "b";
+  const char *key3 = "c";
+
+  const uint16_t ksize1 = strlen(key1);
+  const uint16_t ksize2 = strlen(key2);
+  const uint16_t ksize3 = strlen(key3);
 
   SDB db = {0};
 
@@ -465,14 +496,19 @@ int main(int argc, char const *argv[]) {
     init_leaf_page(page);
 
     const char *val1 = "Jenni";
+    const char *val2 = "Pekka";
+    const char *val3 = "Janne";
     const char *new_val1 = "Janni";
 
-    sdb_leaf_insert(page, key, ksize, val1, strlen(val1));
+    // Some inserts
+    sdb_leaf_insert(page, key2, ksize2, val2, strlen(val2));
+    sdb_leaf_insert(page, key3, ksize3, val3, strlen(val3));
+    sdb_leaf_insert(page, key1, ksize1, val1, strlen(val1));
 
     // this fails
-    if (sdb_leaf_insert(page, key, ksize, new_val1, strlen(new_val1)) < 0) {
+    if (sdb_leaf_insert(page, key1, ksize1, new_val1, strlen(new_val1)) < 0) {
       // this should work
-      sdb_leaf_update(page, key, ksize, new_val1, strlen(new_val1));
+      sdb_leaf_update(page, key1, ksize1, new_val1, strlen(new_val1));
     }
   }
 
@@ -486,8 +522,8 @@ int main(int argc, char const *argv[]) {
 
   for (uint32_t i = 1; i < db.page_count; i++) {
     void *page = sdb_get_page(&db, i);
-    printf("Searching for key %s\n", key);
-    if (sdb_leaf_find(page, key, strlen(key), out_buff, &out_size) == 0) {
+    printf("Searching for key %s\n", key1);
+    if (sdb_leaf_find(page, key1, strlen(key1), out_buff, &out_size) == 0) {
       printf("Found: %s\n", out_buff);
     } else {
       printf("Not found\n");
