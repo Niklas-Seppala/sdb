@@ -10,6 +10,12 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+//
+// -----------------------------------------------------
+// ------------------ Basic opeartions -----------------
+// -----------------------------------------------------
+//
+
 #define PAGE_SIZE 4096
 #define INITIAL_PAGE_COUNT 1
 #define ERR_PAGE_ALLOC ((uint32_t)-1)
@@ -29,11 +35,6 @@
  */
 #define sdb_ssizeof(val) (sizeof(*(&val)))
 
-/**
- * Macro for the end bound (address) of a page
- */
-#define sdb_page_end(page) ((uint8_t *)page + PAGE_SIZE)
-
 typedef struct {
   int fd;
   void *mmapped;
@@ -41,11 +42,24 @@ typedef struct {
   size_t fsize;
 } SDB;
 
-#define RECOR_HEADER_SIZE 4
+static SDB *sdb_open(SDB *db, const char *filepath);
+static void sdb_close(SDB *db);
+
+//
+// -----------------------------------------------------
+// -------------------- Page manager -------------------
+// -----------------------------------------------------
+//
 
 #define PAGE_META_OFFSET 0
 #define PAGE_META 0x01
 #define PAGE_LEAF 0x02
+
+/**
+ * Macro for the end bound (address) of a page
+ */
+#define sdb_page_end(page) ((uint8_t *)page + PAGE_SIZE)
+
 typedef struct {
   uint8_t type;      // META 0x01 | LEAF 0x02
   uint8_t flags;     // RESREVED
@@ -59,13 +73,28 @@ typedef struct {
   uint32_t page_count; // Total number of pages in the database
 } __attribute__((packed)) SDBMetaPage;
 
-static SDB *sdb_open(SDB *db, const char *filepath);
-static void sdb_close(SDB *db);
 static void *sdb_get_page(SDB *db, uint32_t page_num);
 static uint32_t sdb_alloc_page(SDB *db);
 static void init_meta_page(void *page_ptr, uint32_t initial_page_num);
-static size_t leaf_record_space_required(uint16_t ksize, uint16_t vsize);
-static void init_leaf_page(void *page);
+
+//
+// -----------------------------------------------------
+// ------------------ Leaf operations ------------------
+// -----------------------------------------------------
+//
+
+// ---------- Record layout --------------
+// [ 
+//   key_size (2) 
+//   val_size (2)
+//   key      (key_size) 
+//   val      (val_size) 
+// ]
+// ---------------------------------------
+//
+#define RECOR_HEADER_SIZE 4 // key_size + val_size
+
+static void sdb_init_leaf_page(void *page);
 static int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
                            const void *val, uint16_t vsize);
 static int sdb_leaf_find(void *page, const char *key, uint16_t ksize,
@@ -73,304 +102,15 @@ static int sdb_leaf_find(void *page, const char *key, uint16_t ksize,
 static int sdb_leaf_scan(void *page);
 static int sdb_leaf_update(void *page, const void *key, uint16_t ksize,
                            const void *val, uint16_t vsize);
+static uint16_t *sdb_leaf_record_slot_array(void *page);
+static size_t sdb_leaf_record_space_required(uint16_t ksize, uint16_t vsize);
 
-static uint16_t *leaf_record_slot_array(void *page);
 
-static void init_meta_page(void *page_ptr, uint32_t initial_page_num) {
-  memset(page_ptr, 0, PAGE_SIZE);
-  SDBMetaPage *meta_page = page_ptr;
-  meta_page->haeder.type = PAGE_META;
-  meta_page->haeder.flags = 0;
-  meta_page->haeder.count = 0;
-  meta_page->haeder.free_off = sizeof(SDBMetaPage);
-  meta_page->page_count = initial_page_num;
-}
-
-size_t leaf_record_space_required(uint16_t ksize, uint16_t vsize) {
-  return RECOR_HEADER_SIZE + ksize + vsize + sizeof(uint16_t);
-}
-
-static inline uint16_t *leaf_record_slot_array(void *page) {
-  return (uint16_t *)((uint8_t *)page + sizeof(SDBPageHeader));
-}
-
-// Record layout
-//      [ key_size (2) | val_size (2) | key (ksize) | val (vsize) ]
 //
-int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
-                    const void *val, uint16_t vsize) {
-  assert(page != NULL && "page is null");
-  assert(ksize > 0 && "ksize is not valid");
-  assert(vsize > 0 && "vsize is not valid");
-  assert(key != NULL && "key is null");
-  assert(val != NULL && "val is null");
-
-  SDBPageHeader *header = page;
-  assert(header->type == PAGE_LEAF &&
-         "Attempt to write (insert) on non-leaf page");
-  
-  // Enforce key uniqueness.
-  uint16_t *slots = leaf_record_slot_array(page);
-  for (uint16_t i = 0; i < header->count; i++) {
-    uint16_t off = slots[i];
-    uint8_t *rec = (uint8_t*)page + off;
-    uint16_t rec_ksize;
-    memcpy(&rec_ksize, rec, sdb_ssizeof(rec_ksize));
-    if (rec_ksize == ksize && memcmp(rec + 4, key, ksize) == 0) {
-      fprintf(stderr, "record with key='%s' same key exists\n", (char*)key);
-      return SDB_ERR_UNIQ_KEY;
-    }
-  }
-
-  const uint16_t count = header->count;
-  size_t record_size = RECOR_HEADER_SIZE + ksize + vsize;
-  size_t slot_offset = sizeof(SDBPageHeader) + count * sizeof(uint16_t);
-
-  // Offset after all metadata + required space for this write.
-  if ((header->free_off + leaf_record_space_required(ksize, vsize)) >
-      PAGE_SIZE) {
-    return SDB_ERR_PAGE_FULL;
-  }
-
-  // TODO: refactor
-  const uint16_t current_end =
-      (count == 0)
-          // The page is empty, so at the very end.
-          ? PAGE_SIZE
-          // Take it from the last item in 'slot' array
-          : ((uint16_t *)((uint8_t *)page + sizeof(SDBPageHeader)))[count - 1];
-  // Reserve space for the record.
-  const uint16_t offset = current_end - record_size;
-  uint8_t *record = (uint8_t *)page + offset;
-
-  // Write key & value sizes to record header.
-  memcpy(record, &ksize, sdb_ssizeof(ksize));
-  memcpy(record + sdb_ssizeof(ksize), &vsize, sdb_ssizeof(vsize));
-
-  const uint32_t key_offset = sdb_ssizeof(ksize) + sdb_ssizeof(vsize);
-  const uint32_t val_offset = key_offset + ksize;
-
-  const uint8_t *key_ptr = record + key_offset;
-  const uint8_t *val_ptr = record + val_offset;
-
-  assert((key_ptr + ksize + vsize) <= sdb_page_end(page) && "page overflow");
-  assert((val_ptr + vsize) <= sdb_page_end(page) && "page overflow");
-
-  // Write key to record.
-  memcpy(record + key_offset, key, ksize);
-  // Write value to record.
-  memcpy(record + val_offset, val, vsize);
-
-
-  // slots[count] = offset;
-  // Store the record offset to slot array
-  uint16_t insert_pos = count;
-  for (uint16_t i = 0; i < count; i++) {
-    uint16_t off = slots[i];
-    uint8_t *rec = (uint8_t*)page + off;
-    uint16_t rec_ksize;
-    memcpy(&rec_ksize, rec, sdb_ssizeof(rec_ksize));
-    int cmp = memcmp(rec + 4, key, rec_ksize < ksize ? rec_ksize : ksize);
-    if (cmp > 0 || (cmp == 0 && ksize <  rec_ksize)) {
-      insert_pos = i;
-      break;
-    } 
-  }
-  for (int i = header->count; i > insert_pos; i--) {
-    slots[i] = slots[i-1];
-  }
-  slots[insert_pos] = offset;
-
-  // Update header
-  header->count++;
-  // Plus sizeof(uint16_t) because we just added one, duh :P
-  header->free_off += slot_offset + sizeof(uint16_t);
-
-  if (msync(page, PAGE_SIZE, MS_SYNC) < 0) {
-    perror("msync()");
-    return SDB_ERR_SYS;
-  }
-
-  return SDB_SUCCESS;
-}
-
-// Record layout
-//      [ key_size (2) | val_size (2) | key (ksize) | val (vsize) ]
+// -----------------------------------------------------
+// ------------------ Basic opeartions -----------------
+// ----------------------- Impl ------------------------
 //
-int sdb_leaf_find(void *page, const char *key, uint16_t ksize, char *out_val,
-                  u_int16_t *out_vsize) {
-  assert(page != NULL && "Page is null");
-
-  assert(key != NULL && "Key can't be null");
-  assert(ksize > 0 && "Key size can't be zero");
-
-  SDBPageHeader *header = (SDBPageHeader *)page;
-  assert(header->type == PAGE_LEAF && "Attempt to search on non-leaf page");
-
-  uint16_t *slots = leaf_record_slot_array(page);
-
-  for (uint16_t i = 0; i < header->count; i++) {
-    uint16_t offset = slots[i];
-    uint8_t *record = (uint8_t *)page + offset;
-
-    uint16_t rec_ksize = 0, rec_vsize = 0;
-    memcpy(&rec_ksize, record, sdb_ssizeof(rec_ksize));
-    memcpy(&rec_vsize, record + sdb_ssizeof(rec_ksize), sdb_ssizeof(rec_vsize));
-    assert(rec_ksize > 0 && "read invalid key size");
-    assert(rec_vsize > 0 && "read invalid value size");
-
-    if (rec_ksize != ksize) {
-      // Key sizes don't match, can't be the right key.
-      continue;
-    }
-
-    uint32_t key_offset = sdb_ssizeof(rec_ksize) + sdb_ssizeof(rec_vsize);
-    uint32_t value_offset = key_offset + rec_ksize;
-
-    const uint8_t *key_ptr = record + key_offset;
-    const uint8_t *val_ptr = record + value_offset;
-
-    assert((key_ptr + rec_ksize + rec_vsize) <= sdb_page_end(page) &&
-           "page overflow");
-    assert((val_ptr + rec_vsize) <= sdb_page_end(page) && "page overflow");
-
-    if (memcmp(key_ptr, key, ksize) == 0) {
-      // Found a match
-      if (out_val && out_vsize) {
-        // Only write output when requested.
-        memcpy(out_val, val_ptr, rec_vsize);
-        *out_vsize = rec_vsize;
-        out_val[rec_vsize] = '\0'; // TODO: Just strings for now
-      }
-      return SDB_FOUND;
-    }
-  }
-
-  return SDB_NOT_FOUND;
-}
-
-// Record layout
-//      [ key_size (2) | val_size (2) | key (ksize) | val (vsize) ]
-//
-int sdb_leaf_scan(void *page) {
-  assert(page != NULL && "page is null");
-
-  SDBPageHeader *header = page;
-  assert(header->type == PAGE_LEAF && "Attempt to scan non-leaf page");
-
-  uint16_t count = header->count;
-  uint16_t *slots = leaf_record_slot_array(page);
-
-  printf("FULL SCAN:\n");
-  for (uint16_t i = 0; i < count; i++) {
-    uint16_t record_offset = slots[i];
-    uint8_t *record = (uint8_t *)page + record_offset;
-
-    // Read the key and value sizes
-    uint16_t ksize = 0, vsize = 0;
-    memcpy(&ksize, record, sdb_ssizeof(ksize));
-    memcpy(&vsize, record + sdb_ssizeof(ksize), sdb_ssizeof(vsize));
-    assert(ksize > 0 && "read invalid key size");
-    assert(vsize > 0 && "read invalid value size");
-
-    const uint32_t key_offset = sdb_ssizeof(ksize) + sdb_ssizeof(vsize);
-    const uint32_t val_offset = key_offset + ksize;
-
-    const uint8_t *key_ptr = record + key_offset;
-    const uint8_t *val_ptr = record + val_offset;
-
-    assert((key_ptr + ksize + vsize) <= sdb_page_end(page) && "page overflow");
-    assert((val_ptr + vsize) <= sdb_page_end(page) && "page overflow");
-
-    // Read the key.
-    char key[ksize + 1]; //  (+1 for NULL, since we only work on string atm)
-    memcpy(key, key_ptr, ksize);
-    key[ksize] = '\0';
-
-    // Read the value.
-    char val[vsize + 1]; //  (+1 for NULL, since we only work on string atm)
-    memcpy(val, val_ptr, vsize);
-    val[vsize] = '\0';
-
-    printf("\tRecord %d: {key='%s', value='%s'}\n", i, key, val);
-  }
-  printf("--------------------------------\n");
-
-  return SDB_SUCCESS;
-}
-
-// Record layout
-//      [ key_size (2) | val_size (2) | key (ksize) | val (vsize) ]
-//
-int sdb_leaf_update(void *page, const void *key, uint16_t ksize,
-                    const void *val, uint16_t vsize) {
-  assert(page != NULL && "page is null");
-  assert(ksize > 0 && "ksize is not valid");
-  assert(vsize > 0 && "vsize is not valid");
-  assert(key != NULL && "key is null");
-  assert(val != NULL && "val is null");
-
-  SDBPageHeader *header = page;
-  assert(header->type == PAGE_LEAF &&
-         "Attempt to write (update) non-leaf page");
-
-  uint16_t *slots = leaf_record_slot_array(page);
-  for (uint16_t i = 0; i < header->count; i++) {
-    uint16_t record_offset = slots[i];
-    uint8_t *record = (uint8_t *)page + record_offset;
-
-    uint16_t rec_ksize = 0, rec_vsize = 0;
-    memcpy(&rec_ksize, record, sdb_ssizeof(rec_ksize));
-    memcpy(&rec_vsize, record + sdb_ssizeof(rec_ksize), sdb_ssizeof(rec_vsize));
-    assert(rec_ksize > 0 && "invalid rec_ksize read");
-    assert(rec_vsize > 0 && "invalid rec_vsize read");
-
-    if (rec_ksize != ksize) {
-      // Key sizes don't match, can't be the right key.
-      continue;
-    }
-
-    // TODO: support shifting
-    if (rec_ksize != ksize) {
-      fprintf(stderr, "key sizes don't match, won't update key\n");
-      return SDB_NOT_FOUND;
-    }
-    if (rec_vsize != vsize) {
-      fprintf(stderr, "value sizes don't match, won't update value\n");
-      return SDB_NOT_FOUND;
-    }
-
-    uint32_t key_offset = sdb_ssizeof(rec_ksize) + sdb_ssizeof(rec_vsize);
-    uint32_t val_offset = key_offset + rec_ksize;
-
-    uint8_t *key_ptr = record + key_offset;
-    uint8_t *val_ptr = record + val_offset;
-
-    assert((key_ptr + rec_ksize + rec_vsize) <= sdb_page_end(page) &&
-           "page overflow");
-    assert((val_ptr + rec_vsize) <= sdb_page_end(page) && "page overflow");
-
-    if (memcmp(key_ptr, key, ksize) == 0) {
-      // Found a match
-      memcpy(val_ptr, val, vsize);
-      if (msync(page, PAGE_SIZE, MS_SYNC) < 0) {
-        perror("msync()");
-        return SDB_ERR_SYS;
-      }
-      return SDB_SUCCESS;
-    }
-  }
-  return SDB_NOT_FOUND;
-}
-
-void init_leaf_page(void *page) {
-  memset(page, 0, PAGE_SIZE);
-  SDBPageHeader *header = page;
-  header->type = PAGE_LEAF;
-  header->flags = 0;
-  header->count = 0;
-  header->free_off = sizeof(SDBPageHeader);
-}
 
 SDB *sdb_open(SDB *db, const char *filepath) {
   if (db == NULL) {
@@ -427,6 +167,22 @@ void sdb_close(SDB *db) {
   close(db->fd);
 }
 
+//
+// -----------------------------------------------------
+// ------------------- Page Manager --------------------
+// ----------------------- Impl ------------------------
+//
+
+static void init_meta_page(void *page_ptr, uint32_t initial_page_num) {
+  memset(page_ptr, 0, PAGE_SIZE);
+  SDBMetaPage *meta_page = page_ptr;
+  meta_page->haeder.type = PAGE_META;
+  meta_page->haeder.flags = 0;
+  meta_page->haeder.count = 0;
+  meta_page->haeder.free_off = sizeof(SDBMetaPage);
+  meta_page->page_count = initial_page_num;
+}
+
 void *sdb_get_page(SDB *db, uint32_t page_num) {
   if (page_num == PAGE_META_OFFSET) {
     return db->mmapped;
@@ -475,6 +231,293 @@ uint32_t sdb_alloc_page(SDB *db) {
   return new_page_num;
 }
 
+//
+// -----------------------------------------------------
+// ------------------ Leaf operations ------------------
+// ----------------------- Impl ------------------------
+//
+
+static size_t inline sdb_leaf_record_space_required(uint16_t ksize, uint16_t vsize) {
+  return RECOR_HEADER_SIZE + ksize + vsize + sizeof(uint16_t);
+}
+
+static inline uint16_t *sdb_leaf_record_slot_array(void *page) {
+  return (uint16_t *)((uint8_t *)page + sizeof(SDBPageHeader));
+}
+
+void sdb_init_leaf_page(void *page) {
+  memset(page, 0, PAGE_SIZE);
+  SDBPageHeader *header = page;
+  header->type = PAGE_LEAF;
+  header->flags = 0;
+  header->count = 0;
+  header->free_off = sizeof(SDBPageHeader);
+}
+
+
+int sdb_leaf_insert(void *page, const void *key, uint16_t ksize,
+                    const void *val, uint16_t vsize) {
+  assert(page != NULL && "page is null");
+  assert(ksize > 0 && "ksize is not valid");
+  assert(vsize > 0 && "vsize is not valid");
+  assert(key != NULL && "key is null");
+  assert(val != NULL && "val is null");
+
+  SDBPageHeader *header = page;
+  assert(header->type == PAGE_LEAF &&
+         "Attempt to write (insert) on non-leaf page");
+
+  // Enforce key uniqueness.
+  uint16_t *slots = sdb_leaf_record_slot_array(page);
+  for (uint16_t i = 0; i < header->count; i++) {
+    uint16_t off = slots[i];
+    uint8_t *rec = (uint8_t *)page + off;
+    uint16_t rec_ksize;
+    memcpy(&rec_ksize, rec, sdb_ssizeof(rec_ksize));
+    if (rec_ksize == ksize && memcmp(rec + 4, key, ksize) == 0) {
+      fprintf(stderr, "record with key='%s' same key exists\n", (char *)key);
+      return SDB_ERR_UNIQ_KEY;
+    }
+  }
+
+  const uint16_t count = header->count;
+  size_t record_size = RECOR_HEADER_SIZE + ksize + vsize;
+  size_t slot_offset = sizeof(SDBPageHeader) + count * sizeof(uint16_t);
+
+  // Offset after all metadata + required space for this write.
+  if ((header->free_off + sdb_leaf_record_space_required(ksize, vsize)) >
+      PAGE_SIZE) {
+    return SDB_ERR_PAGE_FULL;
+  }
+
+  // TODO: refactor
+  const uint16_t current_end =
+      (count == 0)
+          // The page is empty, so at the very end.
+          ? PAGE_SIZE
+          // Take it from the last item in 'slot' array
+          : ((uint16_t *)((uint8_t *)page + sizeof(SDBPageHeader)))[count - 1];
+  // Reserve space for the record.
+  const uint16_t offset = current_end - record_size;
+  uint8_t *record = (uint8_t *)page + offset;
+
+  // Write key & value sizes to record header.
+  memcpy(record, &ksize, sdb_ssizeof(ksize));
+  memcpy(record + sdb_ssizeof(ksize), &vsize, sdb_ssizeof(vsize));
+
+  const uint32_t key_offset = sdb_ssizeof(ksize) + sdb_ssizeof(vsize);
+  const uint32_t val_offset = key_offset + ksize;
+
+  const uint8_t *key_ptr = record + key_offset;
+  const uint8_t *val_ptr = record + val_offset;
+
+  assert((key_ptr + ksize + vsize) <= sdb_page_end(page) && "page overflow");
+  assert((val_ptr + vsize) <= sdb_page_end(page) && "page overflow");
+
+  // Write key to record.
+  memcpy(record + key_offset, key, ksize);
+  // Write value to record.
+  memcpy(record + val_offset, val, vsize);
+
+  // slots[count] = offset;
+  // Store the record offset to slot array
+  uint16_t insert_pos = count;
+  for (uint16_t i = 0; i < count; i++) {
+    uint16_t off = slots[i];
+    uint8_t *rec = (uint8_t *)page + off;
+    uint16_t rec_ksize;
+    memcpy(&rec_ksize, rec, sdb_ssizeof(rec_ksize));
+    int cmp = memcmp(rec + 4, key, rec_ksize < ksize ? rec_ksize : ksize);
+    if (cmp > 0 || (cmp == 0 && ksize < rec_ksize)) {
+      insert_pos = i;
+      break;
+    }
+  }
+  for (int i = header->count; i > insert_pos; i--) {
+    slots[i] = slots[i - 1];
+  }
+  slots[insert_pos] = offset;
+
+  // Update header
+  header->count++;
+  // Plus sizeof(uint16_t) because we just added one, duh :P
+  header->free_off += slot_offset + sizeof(uint16_t);
+
+  if (msync(page, PAGE_SIZE, MS_SYNC) < 0) {
+    perror("msync()");
+    return SDB_ERR_SYS;
+  }
+
+  return SDB_SUCCESS;
+}
+
+int sdb_leaf_find(void *page, const char *key, uint16_t ksize, char *out_val,
+                  u_int16_t *out_vsize) {
+  assert(page != NULL && "Page is null");
+
+  assert(key != NULL && "Key can't be null");
+  assert(ksize > 0 && "Key size can't be zero");
+
+  SDBPageHeader *header = (SDBPageHeader *)page;
+  assert(header->type == PAGE_LEAF && "Attempt to search on non-leaf page");
+
+  uint16_t *slots = sdb_leaf_record_slot_array(page);
+
+  for (uint16_t i = 0; i < header->count; i++) {
+    uint16_t offset = slots[i];
+    uint8_t *record = (uint8_t *)page + offset;
+
+    uint16_t rec_ksize = 0, rec_vsize = 0;
+    memcpy(&rec_ksize, record, sdb_ssizeof(rec_ksize));
+    memcpy(&rec_vsize, record + sdb_ssizeof(rec_ksize), sdb_ssizeof(rec_vsize));
+    assert(rec_ksize > 0 && "read invalid key size");
+    assert(rec_vsize > 0 && "read invalid value size");
+
+    if (rec_ksize != ksize) {
+      // Key sizes don't match, can't be the right key.
+      continue;
+    }
+
+    uint32_t key_offset = sdb_ssizeof(rec_ksize) + sdb_ssizeof(rec_vsize);
+    uint32_t value_offset = key_offset + rec_ksize;
+
+    const uint8_t *key_ptr = record + key_offset;
+    const uint8_t *val_ptr = record + value_offset;
+
+    assert((key_ptr + rec_ksize + rec_vsize) <= sdb_page_end(page) &&
+           "page overflow");
+    assert((val_ptr + rec_vsize) <= sdb_page_end(page) && "page overflow");
+
+    if (memcmp(key_ptr, key, ksize) == 0) {
+      // Found a match
+      if (out_val && out_vsize) {
+        // Only write output when requested.
+        memcpy(out_val, val_ptr, rec_vsize);
+        *out_vsize = rec_vsize;
+        out_val[rec_vsize] = '\0'; // TODO: Just strings for now
+      }
+      return SDB_FOUND;
+    }
+  }
+
+  return SDB_NOT_FOUND;
+}
+
+int sdb_leaf_scan(void *page) {
+  assert(page != NULL && "page is null");
+
+  SDBPageHeader *header = page;
+  assert(header->type == PAGE_LEAF && "Attempt to scan non-leaf page");
+
+  uint16_t count = header->count;
+  uint16_t *slots = sdb_leaf_record_slot_array(page);
+
+  printf("FULL SCAN:\n");
+  for (uint16_t i = 0; i < count; i++) {
+    uint16_t record_offset = slots[i];
+    uint8_t *record = (uint8_t *)page + record_offset;
+
+    // Read the key and value sizes
+    uint16_t ksize = 0, vsize = 0;
+    memcpy(&ksize, record, sdb_ssizeof(ksize));
+    memcpy(&vsize, record + sdb_ssizeof(ksize), sdb_ssizeof(vsize));
+    assert(ksize > 0 && "read invalid key size");
+    assert(vsize > 0 && "read invalid value size");
+
+    const uint32_t key_offset = sdb_ssizeof(ksize) + sdb_ssizeof(vsize);
+    const uint32_t val_offset = key_offset + ksize;
+
+    const uint8_t *key_ptr = record + key_offset;
+    const uint8_t *val_ptr = record + val_offset;
+
+    assert((key_ptr + ksize + vsize) <= sdb_page_end(page) && "page overflow");
+    assert((val_ptr + vsize) <= sdb_page_end(page) && "page overflow");
+
+    // Read the key.
+    char key[ksize + 1]; //  (+1 for NULL, since we only work on string atm)
+    memcpy(key, key_ptr, ksize);
+    key[ksize] = '\0';
+
+    // Read the value.
+    char val[vsize + 1]; //  (+1 for NULL, since we only work on string atm)
+    memcpy(val, val_ptr, vsize);
+    val[vsize] = '\0';
+
+    printf("\tRecord %d: {key='%s', value='%s'}\n", i, key, val);
+  }
+  printf("--------------------------------\n");
+
+  return SDB_SUCCESS;
+}
+
+int sdb_leaf_update(void *page, const void *key, uint16_t ksize,
+                    const void *val, uint16_t vsize) {
+  assert(page != NULL && "page is null");
+  assert(ksize > 0 && "ksize is not valid");
+  assert(vsize > 0 && "vsize is not valid");
+  assert(key != NULL && "key is null");
+  assert(val != NULL && "val is null");
+
+  SDBPageHeader *header = page;
+  assert(header->type == PAGE_LEAF &&
+         "Attempt to write (update) non-leaf page");
+
+  uint16_t *slots = sdb_leaf_record_slot_array(page);
+  for (uint16_t i = 0; i < header->count; i++) {
+    uint16_t record_offset = slots[i];
+    uint8_t *record = (uint8_t *)page + record_offset;
+
+    uint16_t rec_ksize = 0, rec_vsize = 0;
+    memcpy(&rec_ksize, record, sdb_ssizeof(rec_ksize));
+    memcpy(&rec_vsize, record + sdb_ssizeof(rec_ksize), sdb_ssizeof(rec_vsize));
+    assert(rec_ksize > 0 && "invalid rec_ksize read");
+    assert(rec_vsize > 0 && "invalid rec_vsize read");
+
+    if (rec_ksize != ksize) {
+      // Key sizes don't match, can't be the right key.
+      continue;
+    }
+
+    // TODO: support shifting
+    if (rec_ksize != ksize) {
+      fprintf(stderr, "key sizes don't match, won't update key\n");
+      return SDB_NOT_FOUND;
+    }
+    if (rec_vsize != vsize) {
+      fprintf(stderr, "value sizes don't match, won't update value\n");
+      return SDB_NOT_FOUND;
+    }
+
+    uint32_t key_offset = sdb_ssizeof(rec_ksize) + sdb_ssizeof(rec_vsize);
+    uint32_t val_offset = key_offset + rec_ksize;
+
+    uint8_t *key_ptr = record + key_offset;
+    uint8_t *val_ptr = record + val_offset;
+
+    assert((key_ptr + rec_ksize + rec_vsize) <= sdb_page_end(page) &&
+           "page overflow");
+    assert((val_ptr + rec_vsize) <= sdb_page_end(page) && "page overflow");
+
+    if (memcmp(key_ptr, key, ksize) == 0) {
+      // Found a match
+      memcpy(val_ptr, val, vsize);
+      if (msync(page, PAGE_SIZE, MS_SYNC) < 0) {
+        perror("msync()");
+        return SDB_ERR_SYS;
+      }
+      return SDB_SUCCESS;
+    }
+  }
+  return SDB_NOT_FOUND;
+}
+
+
+//
+// -----------------------------------------------------
+// ---------------------- Testing ----------------------
+// -----------------------------------------------------
+//
+
 int main(int argc, char const *argv[]) {
   const char *key1 = "a";
   const char *key2 = "b";
@@ -493,7 +536,7 @@ int main(int argc, char const *argv[]) {
   uint32_t new_page = sdb_alloc_page(&db);
   if (new_page != ERR_PAGE_ALLOC) {
     void *page = sdb_get_page(&db, new_page);
-    init_leaf_page(page);
+    sdb_init_leaf_page(page);
 
     const char *val1 = "Jenni";
     const char *val2 = "Pekka";
